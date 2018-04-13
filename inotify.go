@@ -21,19 +21,20 @@ import (
 
 // Watcher watches a set of files, delivering events to a channel.
 type Watcher struct {
-	Events   chan Event
-	Errors   chan error
-	mu       sync.Mutex // Map access
-	fd       int
-	poller   *fdPoller
-	watches  map[string]*watch // Map of inotify watches (key: path)
-	paths    map[int]string    // Map of watched paths (key: watch descriptor)
-	done     chan struct{}     // Channel for sending a "quit message" to the reader goroutine
-	doneResp chan struct{}     // Channel to respond to Close
+	Events      chan Event
+	Errors      chan error
+	WatchEvents Op
+	mu          sync.Mutex // Map access
+	fd          int
+	poller      *fdPoller
+	watches     map[string]*watch // Map of inotify watches (key: path)
+	paths       map[int]string    // Map of watched paths (key: watch descriptor)
+	done        chan struct{}     // Channel for sending a "quit message" to the reader goroutine
+	doneResp    chan struct{}     // Channel to respond to Close
 }
 
 // NewWatcher establishes a new watcher with the underlying OS and begins waiting for events.
-func NewWatcher() (*Watcher, error) {
+func NewWatcher(watchEvents Op) (*Watcher, error) {
 	// Create inotify fd
 	fd, errno := unix.InotifyInit1(unix.IN_CLOEXEC)
 	if fd == -1 {
@@ -46,14 +47,15 @@ func NewWatcher() (*Watcher, error) {
 		return nil, err
 	}
 	w := &Watcher{
-		fd:       fd,
-		poller:   poller,
-		watches:  make(map[string]*watch),
-		paths:    make(map[int]string),
-		Events:   make(chan Event),
-		Errors:   make(chan error),
-		done:     make(chan struct{}),
-		doneResp: make(chan struct{}),
+		fd:          fd,
+		poller:      poller,
+		watches:     make(map[string]*watch),
+		WatchEvents: watchEvents,
+		paths:       make(map[int]string),
+		Events:      make(chan Event),
+		Errors:      make(chan error),
+		done:        make(chan struct{}),
+		doneResp:    make(chan struct{}),
 	}
 
 	go w.readEvents()
@@ -94,11 +96,11 @@ func (w *Watcher) Add(name string) error {
 		return errors.New("inotify instance already closed")
 	}
 
-	const agnosticEvents = unix.IN_MOVED_TO | unix.IN_MOVED_FROM |
-		unix.IN_CREATE | unix.IN_ATTRIB | unix.IN_MODIFY |
-		unix.IN_MOVE_SELF | unix.IN_DELETE | unix.IN_DELETE_SELF
+	// const agnosticEvents = unix.IN_MOVED_TO | unix.IN_MOVED_FROM |
+	// 	unix.IN_CREATE | unix.IN_ATTRIB | unix.IN_MODIFY |
+	// 	unix.IN_MOVE_SELF | unix.IN_DELETE | unix.IN_DELETE_SELF
 
-	var flags uint32 = agnosticEvents
+	var flags uint32 = OpToMask(w.WatchEvents)
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -333,5 +335,43 @@ func newEvent(name string, mask uint32) Event {
 	if mask&unix.IN_ATTRIB == unix.IN_ATTRIB {
 		e.Op |= Chmod
 	}
+	if mask&unix.IN_OPEN == unix.IN_OPEN {
+		e.Op |= Open
+	}
+	if mask&unix.IN_ACCESS == unix.IN_ACCESS {
+		e.Op |= Access
+	}
+	if mask&unix.IN_CLOSE > 0 {
+		e.Op |= Close
+	}
 	return e
+}
+
+func OpToMask(op Op) uint32 {
+	var flags uint32
+	if op&Create == Create {
+		flags |= unix.IN_CREATE | unix.IN_MOVED_TO
+	}
+	if op&Remove == Remove {
+		flags |= unix.IN_DELETE_SELF | unix.IN_DELETE
+	}
+	if op&Write == Write {
+		flags |= unix.IN_MODIFY
+	}
+	if op&Rename == Rename {
+		flags |= unix.IN_MOVE_SELF | unix.IN_MOVED_FROM
+	}
+	if op&Chmod == Chmod {
+		flags |= unix.IN_ATTRIB
+	}
+	if op&Open == Open {
+		flags |= unix.IN_OPEN
+	}
+	if op&Access == Access {
+		flags |= unix.IN_ACCESS
+	}
+	if op&Close == Close {
+		flags |= unix.IN_CLOSE
+	}
+	return flags
 }
